@@ -56,8 +56,9 @@ class Wav2VecAlignment:
         orig_len = audio.shape[-1]
 
         with torch.no_grad():
-            self.model = self.model.cuda()
-            audio = audio.to('cuda')
+            if torch.cuda.is_available():
+                self.model = self.model.cuda()
+                audio = audio.to('cuda')
             audio = torchaudio.functional.resample(audio, audio_sample_rate, 16000)
             clip_norm = (audio - audio.mean()) / torch.sqrt(audio.var() + 1e-7)
             logits = self.model(clip_norm).logits

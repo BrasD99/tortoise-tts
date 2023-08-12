@@ -25,6 +25,8 @@ from tortoise.utils.wav2vec_alignment import Wav2VecAlignment
 
 pbar = None
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 def download_models(specific_models=None):
     """
@@ -84,7 +86,7 @@ def load_discrete_vocoder_diffuser(trained_diffusion_steps=4000, desired_diffusi
                            conditioning_free=cond_free, conditioning_free_k=cond_free_k)
 
 
-def format_conditioning(clip, cond_length=132300):
+def format_conditioning(clip, cond_length=132300, mel_norm_file='tortoise/data/mel_norms.pth'):
     """
     Converts the given conditioning signal to a MEL spectrogram and clips it as expected by the models.
     """
@@ -94,8 +96,10 @@ def format_conditioning(clip, cond_length=132300):
     elif gap > 0:
         rand_start = random.randint(0, gap)
         clip = clip[:, rand_start:rand_start + cond_length]
-    mel_clip = TorchMelSpectrogram()(clip.unsqueeze(0)).squeeze(0)
-    return mel_clip.unsqueeze(0).cuda()
+    mel_clip = TorchMelSpectrogram(mel_norm_file=mel_norm_file)(clip.unsqueeze(0)).squeeze(0)
+    if torch.cuda.is_available():
+        return mel_clip.unsqueeze(0).cuda()
+    return mel_clip.unsqueeze(0)
 
 
 def fix_autoregressive_output(codes, stop_token, complain=True):
@@ -165,7 +169,7 @@ class TextToSpeech:
     Main entry point into Tortoise.
     """
 
-    def __init__(self, autoregressive_batch_size=16, models_dir='.models', enable_redaction=True):
+    def __init__(self, autoregressive_batch_size=16, tokenizer_file='.data/tokenizer.json', models_dir='.models', enable_redaction=True):
         """
         Constructor
         :param autoregressive_batch_size: Specifies how many samples to generate per batch. Lower this if you are seeing
@@ -181,7 +185,7 @@ class TextToSpeech:
         if self.enable_redaction:
             self.aligner = Wav2VecAlignment()
 
-        self.tokenizer = VoiceBpeTokenizer()
+        self.tokenizer = VoiceBpeTokenizer(vocab_file=tokenizer_file)
         download_models()
 
         if os.path.exists(f'{models_dir}/autoregressive.ptt'):
@@ -193,32 +197,32 @@ class TextToSpeech:
                                           model_dim=1024,
                                           heads=16, number_text_tokens=255, start_text_token=255, checkpointing=False,
                                           train_solo_embeddings=False).cpu().eval()
-            self.autoregressive.load_state_dict(torch.load(f'{models_dir}/autoregressive.pth'))
+            self.autoregressive.load_state_dict(torch.load(f'{models_dir}/autoregressive.pth', map_location=device))
 
             self.diffusion = DiffusionTts(model_channels=1024, num_layers=10, in_channels=100, out_channels=200,
                                           in_latent_channels=1024, in_tokens=8193, dropout=0, use_fp16=False, num_heads=16,
                                           layer_drop=0, unconditioned_percentage=0).cpu().eval()
-            self.diffusion.load_state_dict(torch.load(f'{models_dir}/diffusion_decoder.pth'))
+            self.diffusion.load_state_dict(torch.load(f'{models_dir}/diffusion_decoder.pth', map_location=device))
 
         self.clvp = CLVP(dim_text=768, dim_speech=768, dim_latent=768, num_text_tokens=256, text_enc_depth=20,
                          text_seq_len=350, text_heads=12,
                          num_speech_tokens=8192, speech_enc_depth=20, speech_heads=12, speech_seq_len=430,
                          use_xformers=True).cpu().eval()
-        self.clvp.load_state_dict(torch.load(f'{models_dir}/clvp2.pth'))
+        self.clvp.load_state_dict(torch.load(f'{models_dir}/clvp2.pth', map_location=device))
 
         self.cvvp = CVVP(model_dim=512, transformer_heads=8, dropout=0, mel_codes=8192, conditioning_enc_depth=8, cond_mask_percentage=0,
                          speech_enc_depth=8, speech_mask_percentage=0, latent_multiplier=1).cpu().eval()
-        self.cvvp.load_state_dict(torch.load(f'{models_dir}/cvvp.pth'))
+        self.cvvp.load_state_dict(torch.load(f'{models_dir}/cvvp.pth', map_location=device))
 
         self.vocoder = UnivNetGenerator().cpu()
-        self.vocoder.load_state_dict(torch.load(f'{models_dir}/vocoder.pth')['model_g'])
+        self.vocoder.load_state_dict(torch.load(f'{models_dir}/vocoder.pth', map_location=device)['model_g'])
         self.vocoder.eval(inference=True)
 
         # Random latent generators (RLGs) are loaded lazily.
         self.rlg_auto = None
         self.rlg_diffusion = None
 
-    def get_conditioning_latents(self, voice_samples, return_mels=False):
+    def get_conditioning_latents(self, voice_samples, mel_norm_file='tortoise/data/mel_norms.pth', return_mels=False):
         """
         Transforms one or more voice_samples into a tuple (autoregressive_conditioning_latent, diffusion_conditioning_latent).
         These are expressive learned latents that encode aspects of the provided clips like voice, intonation, and acoustic
@@ -226,15 +230,19 @@ class TextToSpeech:
         :param voice_samples: List of 2 or more ~10 second reference clips, which should be torch tensors containing 22.05kHz waveform data.
         """
         with torch.no_grad():
-            voice_samples = [v.to('cuda') for v in voice_samples]
+            if torch.cuda.is_available():
+                voice_samples = [v.to('cuda') for v in voice_samples]
 
             auto_conds = []
             if not isinstance(voice_samples, list):
                 voice_samples = [voice_samples]
             for vs in voice_samples:
-                auto_conds.append(format_conditioning(vs))
+                auto_conds.append(format_conditioning(vs, mel_norm_file=mel_norm_file))
             auto_conds = torch.stack(auto_conds, dim=1)
-            self.autoregressive = self.autoregressive.cuda()
+            if torch.cuda.is_available():
+                self.autoregressive = self.autoregressive.cuda()
+            else:
+                self.autoregressive = self.autoregressive
             auto_latent = self.autoregressive.get_conditioning(auto_conds)
             self.autoregressive = self.autoregressive.cpu()
 
@@ -243,11 +251,17 @@ class TextToSpeech:
                 # The diffuser operates at a sample rate of 24000 (except for the latent inputs)
                 sample = torchaudio.functional.resample(sample, 22050, 24000)
                 sample = pad_or_truncate(sample, 102400)
-                cond_mel = wav_to_univnet_mel(sample.to('cuda'), do_normalization=False)
+                if torch.cuda.is_available():
+                    cond_mel = wav_to_univnet_mel(sample.to('cuda'), do_normalization=False)
+                else:
+                    cond_mel = wav_to_univnet_mel(sample, do_normalization=False)
                 diffusion_conds.append(cond_mel)
             diffusion_conds = torch.stack(diffusion_conds, dim=1)
-
-            self.diffusion = self.diffusion.cuda()
+            
+            if torch.cuda.is_available():
+                self.diffusion = self.diffusion.cuda()
+            else:
+                self.diffusion = self.diffusion
             diffusion_latent = self.diffusion.get_conditioning(diffusion_conds)
             self.diffusion = self.diffusion.cpu()
 
@@ -294,6 +308,7 @@ class TextToSpeech:
             # CLVP & CVVP parameters
             clvp_cvvp_slider=.5,
             # diffusion generation parameters follow
+            mel_norm_file='tortoise/data/mel_norms.pth',
             diffusion_iterations=100, cond_free=True, cond_free_k=2, diffusion_temperature=1.0,
             **hf_generate_kwargs):
         """
@@ -343,19 +358,25 @@ class TextToSpeech:
         :return: Generated audio clip(s) as a torch tensor. Shape 1,S if k=1 else, (k,1,S) where S is the sample length.
                  Sample rate is 24kHz.
         """
-        text_tokens = torch.IntTensor(self.tokenizer.encode(text)).unsqueeze(0).cuda()
+        if torch.cuda.is_available():
+            text_tokens = torch.IntTensor(self.tokenizer.encode(text)).unsqueeze(0).cuda()
+        else:
+            text_tokens = torch.IntTensor(self.tokenizer.encode(text)).unsqueeze(0)
+        
         text_tokens = F.pad(text_tokens, (0, 1))  # This may not be necessary.
         assert text_tokens.shape[-1] < 400, 'Too much text provided. Break the text up into separate segments and re-try inference.'
 
         auto_conds = None
         if voice_samples is not None:
-            auto_conditioning, diffusion_conditioning, auto_conds, _ = self.get_conditioning_latents(voice_samples, return_mels=True)
+            auto_conditioning, diffusion_conditioning, auto_conds, _ = self.get_conditioning_latents(voice_samples, return_mels=True, mel_norm_file=mel_norm_file)
         elif conditioning_latents is not None:
             auto_conditioning, diffusion_conditioning = conditioning_latents
         else:
             auto_conditioning, diffusion_conditioning = self.get_random_conditioning_latents()
-        auto_conditioning = auto_conditioning.cuda()
-        diffusion_conditioning = diffusion_conditioning.cuda()
+        
+        if torch.cuda.is_available():
+            auto_conditioning = auto_conditioning.cuda()
+            diffusion_conditioning = diffusion_conditioning.cuda()
 
         diffuser = load_discrete_vocoder_diffuser(desired_diffusion_steps=diffusion_iterations, cond_free=cond_free, cond_free_k=cond_free_k)
 
@@ -364,7 +385,8 @@ class TextToSpeech:
             num_batches = num_autoregressive_samples // self.autoregressive_batch_size
             stop_mel_token = self.autoregressive.stop_mel_token
             calm_token = 83  # This is the token for coding silence, which is fixed in place with "fix_autoregressive_output"
-            self.autoregressive = self.autoregressive.cuda()
+            if torch.cuda.is_available():
+                self.autoregressive = self.autoregressive.cuda()
             if verbose:
                 print("Generating autoregressive samples..")
             for b in tqdm(range(num_batches), disable=not verbose):
@@ -383,8 +405,9 @@ class TextToSpeech:
             self.autoregressive = self.autoregressive.cpu()
 
             clip_results = []
-            self.clvp = self.clvp.cuda()
-            self.cvvp = self.cvvp.cuda()
+            if torch.cuda.is_available():
+                self.clvp = self.clvp.cuda()
+                self.cvvp = self.cvvp.cuda()
             if verbose:
                 print("Computing best candidates using CLVP and CVVP")
             for batch in tqdm(samples, disable=not verbose):
@@ -409,7 +432,8 @@ class TextToSpeech:
             # The diffusion model actually wants the last hidden layer from the autoregressive model as conditioning
             # inputs. Re-produce those for the top results. This could be made more efficient by storing all of these
             # results, but will increase memory usage.
-            self.autoregressive = self.autoregressive.cuda()
+            if torch.cuda.is_available():
+                self.autoregressive = self.autoregressive.cuda()
             best_latents = self.autoregressive(auto_conditioning.repeat(k, 1), text_tokens.repeat(k, 1),
                                                torch.tensor([text_tokens.shape[-1]], device=text_tokens.device), best_results,
                                                torch.tensor([best_results.shape[-1]*self.autoregressive.mel_length_compression], device=text_tokens.device),
@@ -420,8 +444,9 @@ class TextToSpeech:
             if verbose:
                 print("Transforming autoregressive outputs into audio..")
             wav_candidates = []
-            self.diffusion = self.diffusion.cuda()
-            self.vocoder = self.vocoder.cuda()
+            if torch.cuda.is_available():
+                self.diffusion = self.diffusion.cuda()
+                self.vocoder = self.vocoder.cuda()
             for b in range(best_results.shape[0]):
                 codes = best_results[b].unsqueeze(0)
                 latents = best_latents[b].unsqueeze(0)

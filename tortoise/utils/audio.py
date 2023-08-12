@@ -82,21 +82,21 @@ def dynamic_range_decompression(x, C=1):
     return torch.exp(x) / C
 
 
-def get_voices():
-    subs = os.listdir('tortoise/voices')
+def get_voices(voices_dir):
+    subs = os.listdir(voices_dir)
     voices = {}
     for sub in subs:
-        subj = os.path.join('tortoise/voices', sub)
+        subj = os.path.join(voices_dir, sub)
         if os.path.isdir(subj):
             voices[sub] = list(glob(f'{subj}/*.wav')) + list(glob(f'{subj}/*.mp3')) + list(glob(f'{subj}/*.pth'))
     return voices
 
 
-def load_voice(voice):
+def load_voice(voice, voices_dir):
     if voice == 'random':
         return None, None
 
-    voices = get_voices()
+    voices = get_voices(voices_dir)
     paths = voices[voice]
     if len(paths) == 1 and paths[0].endswith('.pth'):
         return None, torch.load(paths[0])
@@ -174,7 +174,8 @@ class TacotronSTFT(torch.nn.Module):
 
 def wav_to_univnet_mel(wav, do_normalization=False):
     stft = TacotronSTFT(1024, 256, 1024, 100, 24000, 0, 12000)
-    stft = stft.cuda()
+    if torch.cuda.is_available():
+        stft = stft.cuda()
     mel = stft.mel_spectrogram(wav)
     if do_normalization:
         mel = normalize_tacotron_mel(mel)
